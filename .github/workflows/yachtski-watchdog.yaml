@@ -1,0 +1,195 @@
+name: Yachtski CSV Watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 9:00 AM Pacific daily = 17:00 UTC (during standard time)
+    # If you want it to always align with local daylight changes, we can adjust seasonally.
+    - cron: "0 17 * * *"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      CSV_URL: "https://raw.githubusercontent.com/trilljester/harboraudio-yachtski/main/yachtski.csv"
+
+      # Freshness thresholds (hours)
+      WARN_STALE_HOURS: "24"
+      FAIL_STALE_HOURS: "48"
+
+      # Required columns (comma-separated). Leave empty to skip strict column enforcement.
+      # Tip: run once with this empty, then copy the printed header list into here.
+      REQUIRED_COLUMNS: ""
+
+      # Duplicate key columns (comma-separated)
+      DEDUPE_KEY: "artist,title"
+
+    steps:
+      - name: Checkout repo (for fallback freshness + comparison)
+        uses: actions/checkout@v4
+
+      - name: Fetch raw CSV (and headers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Fetching: $CSV_URL"
+
+          # Grab headers + body
+          curl -sS -L -D headers.txt -o fetched.csv "$CSV_URL"
+
+          echo "---- Response headers ----"
+          sed -n '1,30p' headers.txt || true
+          echo "--------------------------"
+
+          # Basic sanity
+          if [ ! -s fetched.csv ]; then
+            echo "::error::Fetched CSV is empty (0 bytes)."
+            exit 1
+          fi
+
+          echo "Fetched size (bytes): $(wc -c < fetched.csv)"
+
+      - name: Audit CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, os, re, sys
+          from datetime import datetime, timezone
+          from email.utils import parsedate_to_datetime
+
+          CSV_URL = os.environ["CSV_URL"]
+          WARN_H = float(os.environ.get("WARN_STALE_HOURS", "24"))
+          FAIL_H = float(os.environ.get("FAIL_STALE_HOURS", "48"))
+          REQUIRED = [c.strip() for c in os.environ.get("REQUIRED_COLUMNS","").split(",") if c.strip()]
+          DEDUPE = [c.strip() for c in os.environ.get("DEDUPE_KEY","artist,title").split(",") if c.strip()]
+
+          def gh_error(msg): print(f"::error::{msg}")
+          def gh_warn(msg):  print(f"::warning::{msg}")
+          def info(msg):     print(msg)
+
+          # ---- Parse Last-Modified header (preferred freshness signal)
+          last_modified = None
+          try:
+            with open("headers.txt","r",encoding="utf-8",errors="ignore") as f:
+              headers = f.read()
+            m = re.search(r"^Last-Modified:\s*(.+)\r?$", headers, flags=re.IGNORECASE | re.MULTILINE)
+            if m:
+              last_modified = parsedate_to_datetime(m.group(1).strip())
+              if last_modified.tzinfo is None:
+                last_modified = last_modified.replace(tzinfo=timezone.utc)
+          except Exception as e:
+            gh_warn(f"Could not parse Last-Modified header: {e}")
+
+          # ---- Fallback freshness: git last commit time for yachtski.csv in repo
+          # (Useful if Last-Modified is missing for any reason)
+          git_commit_time = None
+          try:
+            import subprocess
+            p = subprocess.run(
+              ["git", "log", "-1", "--format=%cI", "--", "yachtski.csv"],
+              check=False, capture_output=True, text=True
+            )
+            if p.returncode == 0 and p.stdout.strip():
+              git_commit_time = datetime.fromisoformat(p.stdout.strip().replace("Z","+00:00"))
+          except Exception as e:
+            gh_warn(f"Could not get git commit time for yachtski.csv: {e}")
+
+          now = datetime.now(timezone.utc)
+
+          def age_hours(dt):
+            return (now - dt).total_seconds()/3600.0
+
+          freshness_source = None
+          freshness_dt = None
+          if last_modified is not None:
+            freshness_source = "HTTP Last-Modified"
+            freshness_dt = last_modified
+          elif git_commit_time is not None:
+            freshness_source = "git commit time (fallback)"
+            freshness_dt = git_commit_time
+
+          # ---- Load CSV
+          with open("fetched.csv", newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            header = reader.fieldnames or []
+            header_lc = [h.strip() for h in header]
+            info(f"CSV_URL: {CSV_URL}")
+            info(f"Header ({len(header_lc)}): {header_lc}")
+
+            if not header_lc:
+              gh_error("CSV has no header row / could not parse columns.")
+              sys.exit(1)
+
+            # Required column check (optional)
+            if REQUIRED:
+              missing = [c for c in REQUIRED if c not in header_lc]
+              if missing:
+                gh_error(f"Missing required columns: {missing}. Present columns: {header_lc}")
+                sys.exit(1)
+              else:
+                info(f"Required columns OK: {REQUIRED}")
+            else:
+              info("REQUIRED_COLUMNS is empty; skipping strict schema enforcement.")
+
+            # Row + duplicate checks
+            rows = 0
+            dup_count = 0
+            seen = set()
+            for r in reader:
+              rows += 1
+              # Build dedupe key from configured columns (casefolded, trimmed)
+              key_parts = []
+              for k in DEDUPE:
+                key_parts.append((r.get(k, "") or "").strip().casefold())
+              key = tuple(key_parts)
+              if any(key):  # don’t count totally empty keys
+                if key in seen:
+                  dup_count += 1
+                else:
+                  seen.add(key)
+
+            if rows <= 0:
+              gh_error("CSV has zero data rows.")
+              sys.exit(1)
+
+            info(f"Rows: {rows}")
+            info(f"Duplicate rows by key {DEDUPE}: {dup_count}")
+
+            if dup_count > 0:
+              gh_warn(f"Found {dup_count} duplicates using key={DEDUPE} (not failing, but suspicious).")
+
+          # ---- Freshness evaluation
+          if freshness_dt is None:
+            gh_warn("Could not determine freshness (no Last-Modified header and no git commit fallback).")
+          else:
+            hours = age_hours(freshness_dt)
+            info(f"Freshness: {freshness_source} = {freshness_dt.isoformat()} (age {hours:.2f}h)")
+
+            if hours >= FAIL_H:
+              gh_error(f"STALE: CSV appears {hours:.1f}h old (>= {FAIL_H}h). Possible Monkey cron failure.")
+              sys.exit(1)
+            elif hours >= WARN_H:
+              gh_warn(f"Aging: CSV appears {hours:.1f}h old (>= {WARN_H}h). Keep an eye on Monkey cron.")
+            else:
+              info("Freshness: OK ✅")
+
+          info("Yachtski watchdog: PASS ✅")
+          PY
+
+      - name: Compare fetched CSV vs repo copy (optional sanity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f yachtski.csv ]; then
+            if cmp -s yachtski.csv fetched.csv; then
+              echo "Repo yachtski.csv matches fetched raw content ✅"
+            else
+              echo "::warning::Repo yachtski.csv differs from fetched raw content. (Raw may be cached briefly, or repo file differs.)"
+            fi
+          else
+            echo "::warning::No yachtski.csv found in repo root. Skipping comparison."
+          fi

@@ -22,7 +22,7 @@ jobs:
 
       # Required columns (comma-separated). Leave empty to skip strict column enforcement.
       # Tip: run once with this empty, then copy the printed header list into here.
-      REQUIRED_COLUMNS: ""
+      REQUIRED_COLUMNS: "Yachtski Score,Artist,Title"
 
       # Duplicate key columns (comma-separated)
       DEDUPE_KEY: "artist,title"

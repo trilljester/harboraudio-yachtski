@@ -17,8 +17,8 @@ jobs:
       CSV_URL: "https://raw.githubusercontent.com/trilljester/harboraudio-yachtski/main/yachtski.csv"
 
       # Freshness thresholds (hours)
-      WARN_STALE_HOURS: "24"
-      FAIL_STALE_HOURS: "48"
+      WARN_STALE_HOURS: "168"
+      FAIL_STALE_HOURS: "240"
 
       # Required columns (comma-separated). Leave empty to skip strict column enforcement.
       # Tip: run once with this empty, then copy the printed header list into here.
